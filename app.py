@@ -5,7 +5,30 @@ import subprocess
 import shutil
 import discord
 from discord.ext import commands
-from music_module import setup_music  # music_module.py 사용
+from music_module import setup_music
+
+import socket, os, random
+
+
+def stun_udp_test(host="stun.l.google.com", port=19302, timeout=3):
+    # STUN Binding Request (RFC5389) 최소 패킷
+    tid = random.randbytes(12) if hasattr(random, "randbytes") else os.urandom(12)
+    msg = b"\x00\x01" + b"\x00\x00" + b"\x21\x12\xa4\x42" + tid
+
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(timeout)
+    try:
+        s.sendto(msg, (host, port))
+        data, addr = s.recvfrom(2048)
+        print(f"[UDP TEST] STUN response OK from {addr}, len={len(data)}")
+    except Exception as e:
+        print(f"[UDP TEST] STUN failed: {type(e).__name__}: {e}")
+    finally:
+        s.close()
+
+
+stun_udp_test()
+# music_module.py 사용
 
 # =========================
 # 기본 경로
