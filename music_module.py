@@ -1,10 +1,7 @@
 import discord
 import asyncio
 import re
-import sys
-import os
 import subprocess
-import shutil
 from collections import deque
 from discord.utils import get
 
@@ -26,29 +23,38 @@ def _get_queue(guild_id: int) -> deque:
     return queues[guild_id]
 
 # =========================
-# yt-dlp 호출 함수
+# yt-dlp 호출 함수 (비동기/논블로킹)
 # =========================
-def get_stream_info(query: str, ytdlp_bin: str, allow_search: bool = True):
+async def get_stream_info(query: str, ytdlp_bin: str, allow_search: bool = True):
     """
-    ytdlp_bin: windows=yt-dlp.exe or full path, linux=docker=yt-dlp
+    yt-dlp를 thread에서 실행해서 discord 이벤트 루프(heartbeat)를 막지 않게 함.
     """
     if allow_search and not re.match(r"^(https?\:\/\/)?(www\.youtube\.com|youtu\.?be)\/.+$", query):
         query = f"ytsearch1:{query}"
 
-    result = subprocess.run(
-        [
-            ytdlp_bin,
-            "-f", "bestaudio/best",
-            "--no-playlist",
-            "--quiet",
-            "--print", "url",
-            "--print", "title",
-            "--print", "original_url",
-            query
-        ],
-        capture_output=True,
-        text=True
-    )
+    def _run():
+        return subprocess.run(
+            [
+                ytdlp_bin,
+                "-f", "bestaudio/best",
+                "--no-playlist",
+                "--quiet",
+                "--print", "url",
+                "--print", "title",
+                "--print", "original_url",
+                query
+            ],
+            capture_output=True,
+            text=True,
+            timeout=20,   # ✅ 너무 오래 걸리면 끊기 (Cloud 환경에서 필수)
+        )
+
+    try:
+        result = await asyncio.to_thread(_run)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("yt-dlp 조회 시간이 너무 오래 걸립니다. 잠시 후 다시 시도해주세요.")
+    except FileNotFoundError:
+        raise RuntimeError(f"yt-dlp 실행 파일을 찾을 수 없습니다: {ytdlp_bin}")
 
     if result.returncode != 0:
         err = (result.stderr or "").strip()
@@ -61,14 +67,28 @@ def get_stream_info(query: str, ytdlp_bin: str, allow_search: bool = True):
     stream_url, title, original_url = lines
     return stream_url, title, original_url
 
-def get_duration(url: str, ytdlp_bin: str) -> int:
-    result = subprocess.run(
-        [ytdlp_bin, "--no-playlist", "--quiet", "--print", "duration", url],
-        capture_output=True,
-        text=True
-    )
+async def get_duration(url: str, ytdlp_bin: str) -> int:
+    """
+    영상 길이 조회도 thread에서 실행
+    """
+    def _run():
+        return subprocess.run(
+            [ytdlp_bin, "--no-playlist", "--quiet", "--print", "duration", url],
+            capture_output=True,
+            text=True,
+            timeout=15
+        )
+
+    try:
+        result = await asyncio.to_thread(_run)
+    except subprocess.TimeoutExpired:
+        return 0
+    except FileNotFoundError:
+        return 0
+
     if result.returncode != 0:
         return 0
+
     out = result.stdout.strip()
     return int(out) if out.isdigit() else 0
 
@@ -186,7 +206,7 @@ def setup_music(bot, ffmpeg_bin: str, ytdlp_bin: str):
         await ctx.send(f"🔍 '{query}' 확인 중...")
 
         try:
-            stream_url, title, original_url = get_stream_info(query, ytdlp_bin, allow_search=True)
+            stream_url, title, original_url = await get_stream_info(query, ytdlp_bin, allow_search=True)
 
             item = {
                 "query": query,
@@ -219,7 +239,7 @@ def setup_music(bot, ffmpeg_bin: str, ytdlp_bin: str):
         await ctx.send("🔗 유튜브 링크 확인 중...")
 
         try:
-            stream_url, title, original_url = get_stream_info(url, ytdlp_bin, allow_search=False)
+            stream_url, title, original_url = await get_stream_info(url, ytdlp_bin, allow_search=False)
 
             item = {
                 "query": url,
@@ -308,7 +328,7 @@ def setup_music(bot, ffmpeg_bin: str, ytdlp_bin: str):
         current_pos = song["seek_offset"] + elapsed
         new_pos = current_pos + seconds
 
-        duration = get_duration(song["webpage_url"], ytdlp_bin)
+        duration = await get_duration(song["webpage_url"], ytdlp_bin)
 
         await ctx.send(f"⏩ {seconds}초 빨리감기 중...")
 
@@ -344,7 +364,7 @@ def setup_music(bot, ffmpeg_bin: str, ytdlp_bin: str):
         current_pos = song["seek_offset"] + elapsed
         new_pos = max(0, current_pos - seconds)
 
-        duration = get_duration(song["webpage_url"], ytdlp_bin)
+        duration = await get_duration(song["webpage_url"], ytdlp_bin)
 
         await ctx.send(f"⏪ {seconds}초 되감기 중...")
 
