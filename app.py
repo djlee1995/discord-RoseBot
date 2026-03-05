@@ -9,6 +9,9 @@ from music_module import setup_music
 
 import socket, os, random
 
+if os.getenv("DISCORD_DEBUG") == "1":
+    import logging
+    logging.basicConfig(level=logging.DEBUG)
 
 def stun_udp_test(host="stun.l.google.com", port=19302, timeout=3):
     # STUN Binding Request (RFC5389) 최소 패킷

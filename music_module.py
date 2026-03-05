@@ -105,7 +105,7 @@ async def _ensure_connected(bot, ctx):
 
     # 없으면 새로 연결
     if voice_client is None:
-        return await channel.connect(timeout=60, reconnect=False)
+        return await channel.connect(timeout=60, reconnect=False, self_deaf=False)
 
     # 다른 채널이면 이동
     if voice_client.channel != channel:
