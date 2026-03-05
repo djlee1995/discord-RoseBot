@@ -9,83 +9,7 @@ from collections import deque
 from discord.utils import get
 
 # =========================
-# 경로 설정
-# =========================
-if getattr(sys, "frozen", False):
-    RESOURCE_DIR = sys._MEIPASS
-    BASE_DIR = os.path.dirname(sys.executable)
-else:
-    RESOURCE_DIR = os.path.dirname(os.path.abspath(__file__))
-    BASE_DIR = RESOURCE_DIR
-
-IS_WINDOWS = sys.platform.startswith("win")
-
-FFMPEG_BIN = "ffmpeg.exe" if IS_WINDOWS else "ffmpeg"
-YTDLP_BIN = "yt-dlp.exe" if IS_WINDOWS else "yt-dlp"
-
-# PyInstaller exe 포함본 우선, 없으면 시스템 경로 사용
-if IS_WINDOWS:
-    bundled_ffmpeg = os.path.join(RESOURCE_DIR, "ffmpeg.exe")
-    ffmpeg_path = bundled_ffmpeg if os.path.exists(bundled_ffmpeg) else FFMPEG_BIN
-    bundled_ytdlp = os.path.join(BASE_DIR, "yt-dlp.exe")
-    ytdlp_exe = bundled_ytdlp if os.path.exists(bundled_ytdlp) else YTDLP_BIN
-else:
-    ffmpeg_path = shutil.which("ffmpeg") or "ffmpeg"
-    ytdlp_exe = shutil.which("yt-dlp") or "yt-dlp"
-
-ffmpeg_options = {
-    "executable": ffmpeg_path,
-    "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -nostdin",
-    "options": "-vn"
-}
-
-# Windows에서만 opus.dll 수동 로드
-if IS_WINDOWS:
-    OPUS_PATH = os.path.join(RESOURCE_DIR, "opus.dll")
-    if not discord.opus.is_loaded():
-        try:
-            discord.opus.load_opus(OPUS_PATH)
-        except OSError:
-            raise RuntimeError(f"Opus DLL 로드 실패: {OPUS_PATH}")
-
-# =========================
-# yt-dlp 호출 함수
-# =========================
-def get_stream_info(query: str, allow_search: bool = True):
-    if allow_search and not re.match(r"^(https?\:\/\/)?(www\.youtube\.com|youtu\.?be)\/.+$", query):
-        query = f"ytsearch1:{query}"
-
-    result = subprocess.run(
-        [ytdlp_exe, "-f", "bestaudio/best", "--no-playlist", "--quiet",
-         "--print", "url", "--print", "title", "--print", "original_url", query],
-        capture_output=True,
-        text=True
-    )
-
-    if result.returncode != 0:
-        raise RuntimeError(f"yt-dlp 실행 실패: {result.stderr.strip()}")
-
-    lines = result.stdout.strip().splitlines()
-    if len(lines) < 3:
-        raise RuntimeError("yt-dlp 결과가 올바르지 않습니다.")
-
-    stream_url, title, original_url = lines
-    return stream_url, title, original_url
-
-def get_duration(url: str) -> int:
-    result = subprocess.run(
-        [ytdlp_exe, "--no-playlist", "--quiet", "--print", "duration", url],
-        capture_output=True,
-        text=True
-    )
-    if result.returncode != 0:
-        return 0
-
-    out = result.stdout.strip()
-    return int(out) if out.isdigit() else 0
-
-# =========================
-# 상태 저장
+# 전역 상태
 # =========================
 queues = {}
 play_locks = {}
@@ -101,6 +25,56 @@ def _get_queue(guild_id: int) -> deque:
         queues[guild_id] = deque()
     return queues[guild_id]
 
+# =========================
+# yt-dlp 호출 함수
+# =========================
+def get_stream_info(query: str, ytdlp_bin: str, allow_search: bool = True):
+    """
+    ytdlp_bin: windows=yt-dlp.exe or full path, linux=docker=yt-dlp
+    """
+    if allow_search and not re.match(r"^(https?\:\/\/)?(www\.youtube\.com|youtu\.?be)\/.+$", query):
+        query = f"ytsearch1:{query}"
+
+    result = subprocess.run(
+        [
+            ytdlp_bin,
+            "-f", "bestaudio/best",
+            "--no-playlist",
+            "--quiet",
+            "--print", "url",
+            "--print", "title",
+            "--print", "original_url",
+            query
+        ],
+        capture_output=True,
+        text=True
+    )
+
+    if result.returncode != 0:
+        err = (result.stderr or "").strip()
+        raise RuntimeError(f"yt-dlp 실행 실패: {err}")
+
+    lines = result.stdout.strip().splitlines()
+    if len(lines) < 3:
+        raise RuntimeError("yt-dlp 결과가 올바르지 않습니다.")
+
+    stream_url, title, original_url = lines
+    return stream_url, title, original_url
+
+def get_duration(url: str, ytdlp_bin: str) -> int:
+    result = subprocess.run(
+        [ytdlp_bin, "--no-playlist", "--quiet", "--print", "duration", url],
+        capture_output=True,
+        text=True
+    )
+    if result.returncode != 0:
+        return 0
+    out = result.stdout.strip()
+    return int(out) if out.isdigit() else 0
+
+# =========================
+# 음성 연결 보장
+# =========================
 async def _ensure_connected(bot, ctx):
     if not ctx.author.voice:
         await ctx.send("먼저 음성 채널에 들어가 주세요!")
@@ -109,10 +83,11 @@ async def _ensure_connected(bot, ctx):
     channel = ctx.author.voice.channel
     voice_client = get(bot.voice_clients, guild=ctx.guild)
 
+    # 없으면 새로 연결
     if voice_client is None:
-        voice_client = await channel.connect(timeout=60, reconnect=False)
-        return voice_client
+        return await channel.connect(timeout=60, reconnect=False)
 
+    # 다른 채널이면 이동
     if voice_client.channel != channel:
         await voice_client.move_to(channel)
 
@@ -121,7 +96,10 @@ async def _ensure_connected(bot, ctx):
 # =========================
 # 재생 로직
 # =========================
-async def _start_play(ctx, bot, item, seek_seconds=0):
+async def _start_play(ctx, bot, item, ffmpeg_bin: str, seek_seconds=0):
+    """
+    ffmpeg_bin: windows=ffmpeg.exe or full path, linux=docker=ffmpeg
+    """
     try:
         stream_url = item["stream_url"]
         title = item["title"]
@@ -136,13 +114,19 @@ async def _start_play(ctx, bot, item, seek_seconds=0):
                 asyncio.run_coroutine_threadsafe(
                     ctx.send(f"⚠️ 재생 중 오류 발생: {error}"), bot.loop
                 )
-            asyncio.run_coroutine_threadsafe(play_next(ctx, bot), bot.loop)
+            asyncio.run_coroutine_threadsafe(play_next(ctx, bot, ffmpeg_bin), bot.loop)
 
-        ffmpeg_opts = ffmpeg_options.copy()
+        before = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -nostdin"
         if seek_seconds > 0:
-            ffmpeg_opts["before_options"] += f" -ss {seek_seconds}"
+            before += f" -ss {seek_seconds}"
 
-        source = discord.FFmpegPCMAudio(stream_url, **ffmpeg_opts)
+        source = discord.FFmpegPCMAudio(
+            stream_url,
+            executable=ffmpeg_bin,
+            before_options=before,
+            options="-vn"
+        )
+
         voice_client.play(source, after=after_playing)
 
         current_song[ctx.guild.id] = {
@@ -160,9 +144,9 @@ async def _start_play(ctx, bot, item, seek_seconds=0):
 
     except Exception as e:
         await ctx.send(f"⚠️ 재생 실패: {e}")
-        asyncio.create_task(play_next(ctx, bot))
+        asyncio.create_task(play_next(ctx, bot, ffmpeg_bin))
 
-async def play_next(ctx, bot):
+async def play_next(ctx, bot, ffmpeg_bin: str):
     guild_id = ctx.guild.id
     lock = _get_lock(guild_id)
 
@@ -183,9 +167,16 @@ async def play_next(ctx, bot):
             return
 
         item = q.popleft()
-        await _start_play(ctx, bot, item)
+        await _start_play(ctx, bot, item, ffmpeg_bin)
 
-def setup_music(bot):
+# =========================
+# 봇 커맨드 등록
+# =========================
+def setup_music(bot, ffmpeg_bin: str, ytdlp_bin: str):
+    """
+    app.py에서 OS에 맞게 해석한 ffmpeg_bin / ytdlp_bin을 받아서 사용
+    """
+
     @bot.command(name="재생")
     async def play(ctx, *, query: str):
         voice_client = await _ensure_connected(bot, ctx)
@@ -195,7 +186,7 @@ def setup_music(bot):
         await ctx.send(f"🔍 '{query}' 확인 중...")
 
         try:
-            stream_url, title, original_url = get_stream_info(query, allow_search=True)
+            stream_url, title, original_url = get_stream_info(query, ytdlp_bin, allow_search=True)
 
             item = {
                 "query": query,
@@ -209,7 +200,7 @@ def setup_music(bot):
             await ctx.send(f"🎵 '{title}'을(를) 대기열에 추가했습니다. 위치: {len(q)}")
 
             if not voice_client.is_playing() and not voice_client.is_paused():
-                await play_next(ctx, bot)
+                await play_next(ctx, bot, ffmpeg_bin)
 
         except Exception as e:
             await ctx.send(f"⚠️ 오류 발생: {e}")
@@ -228,7 +219,7 @@ def setup_music(bot):
         await ctx.send("🔗 유튜브 링크 확인 중...")
 
         try:
-            stream_url, title, original_url = get_stream_info(url, allow_search=False)
+            stream_url, title, original_url = get_stream_info(url, ytdlp_bin, allow_search=False)
 
             item = {
                 "query": url,
@@ -242,7 +233,7 @@ def setup_music(bot):
             await ctx.send(f"🎵 '{title}'을(를) 대기열에 추가했습니다. 위치: {len(q)}")
 
             if not voice_client.is_playing() and not voice_client.is_paused():
-                await play_next(ctx, bot)
+                await play_next(ctx, bot, ffmpeg_bin)
 
         except Exception as e:
             await ctx.send(f"⚠️ 오류 발생: {e}")
@@ -317,7 +308,7 @@ def setup_music(bot):
         current_pos = song["seek_offset"] + elapsed
         new_pos = current_pos + seconds
 
-        duration = get_duration(song["webpage_url"])
+        duration = get_duration(song["webpage_url"], ytdlp_bin)
 
         await ctx.send(f"⏩ {seconds}초 빨리감기 중...")
 
@@ -332,7 +323,7 @@ def setup_music(bot):
             "stream_url": song["stream_url"],
             "webpage_url": song["webpage_url"]
         }
-        await _start_play(ctx, bot, item, seek_seconds=new_pos)
+        await _start_play(ctx, bot, item, ffmpeg_bin, seek_seconds=new_pos)
         await ctx.send(f"⏩ {seconds}초 빨리감기 (현재 {new_pos}/{duration}초)")
 
     @bot.command(name="되감기")
@@ -353,7 +344,7 @@ def setup_music(bot):
         current_pos = song["seek_offset"] + elapsed
         new_pos = max(0, current_pos - seconds)
 
-        duration = get_duration(song["webpage_url"])
+        duration = get_duration(song["webpage_url"], ytdlp_bin)
 
         await ctx.send(f"⏪ {seconds}초 되감기 중...")
 
@@ -363,5 +354,5 @@ def setup_music(bot):
             "stream_url": song["stream_url"],
             "webpage_url": song["webpage_url"]
         }
-        await _start_play(ctx, bot, item, seek_seconds=new_pos)
+        await _start_play(ctx, bot, item, ffmpeg_bin, seek_seconds=new_pos)
         await ctx.send(f"⏪ {seconds}초 되감기 (현재 {new_pos}/{duration}초)")
